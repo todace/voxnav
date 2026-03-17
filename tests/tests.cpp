@@ -496,7 +496,136 @@ TEST(path_optimality) {
 }
 
 // ============================================================================
-// 5. Thread Safety / Async Tests
+// 5. Raycast Error Test
+// ============================================================================
+
+// Moller-Trumbore ray-triangle intersection
+static bool rayTriIntersect(const Vec3& orig, const Vec3& dir,
+                            const Vec3& v0, const Vec3& v1, const Vec3& v2,
+                            float& t) {
+    const float EPSILON = 1e-7f;
+    Vec3 e1 = v1 - v0;
+    Vec3 e2 = v2 - v0;
+    Vec3 h = dir.cross(e2);
+    float a = e1.dot(h);
+    if (a > -EPSILON && a < EPSILON) return false;
+    float f = 1.0f / a;
+    Vec3 s = orig - v0;
+    float u = f * s.dot(h);
+    if (u < 0.0f || u > 1.0f) return false;
+    Vec3 q = s.cross(e1);
+    float v = f * dir.dot(q);
+    if (v < 0.0f || u + v > 1.0f) return false;
+    t = f * e2.dot(q);
+    return t > EPSILON;
+}
+
+// Raycast against a mesh, return closest hit distance (negative if no hit)
+static float raycastMesh(const Vec3& orig, const Vec3& dir,
+                         const std::vector<Vec3>& verts,
+                         const std::vector<uint32_t>& indices) {
+    float closest = -1.0f;
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+        float t;
+        if (rayTriIntersect(orig, dir, verts[indices[i]], verts[indices[i+1]], verts[indices[i+2]], t)) {
+            if (closest < 0 || t < closest) closest = t;
+        }
+    }
+    return closest;
+}
+
+// Create a UV sphere mesh procedurally
+static Mesh makeUVSphere(float radius, int slices, int stacks) {
+    Mesh m;
+    // Generate vertices
+    for (int j = 0; j <= stacks; ++j) {
+        float phi = 3.14159265f * j / stacks;
+        float sp = std::sin(phi), cp = std::cos(phi);
+        for (int i = 0; i <= slices; ++i) {
+            float theta = 2.0f * 3.14159265f * i / slices;
+            float st = std::sin(theta), ct = std::cos(theta);
+            m.vertices.push_back({radius * sp * ct, radius * cp, radius * sp * st});
+        }
+    }
+    // Generate indices
+    for (int j = 0; j < stacks; ++j) {
+        for (int i = 0; i < slices; ++i) {
+            uint32_t a = j * (slices + 1) + i;
+            uint32_t b = a + slices + 1;
+            m.indices.push_back(a);
+            m.indices.push_back(b);
+            m.indices.push_back(a + 1);
+            m.indices.push_back(a + 1);
+            m.indices.push_back(b);
+            m.indices.push_back(b + 1);
+        }
+    }
+    return m;
+}
+
+TEST(simplified_vs_original_raycast) {
+    // Create a unit sphere, voxelize, extract simplified surface
+    Mesh sphere = makeUVSphere(2.0f, 24, 16);
+    AABB region = {{-3, -3, -3}, {3, 3, 3}};
+    float vs = 0.2f;
+    VoxelGrid grid = voxelize(sphere, region, vs);
+    SimplifiedMesh simplified = extractSurface(grid);
+
+    ASSERT_GT(simplified.triangleCount(), 10u);
+
+    // Cast random rays from outside the sphere toward the origin
+    // Use a simple pseudo-random generator for reproducibility
+    int numRays = 200;
+    int hitsOrig = 0, hitsSimp = 0, hitsBoth = 0;
+    float sumSqError = 0;
+
+    auto pseudoRand = [](int seed) -> float {
+        // Simple hash-based pseudo-random [0,1]
+        unsigned int h = static_cast<unsigned int>(seed);
+        h = ((h >> 16) ^ h) * 0x45d9f3b;
+        h = ((h >> 16) ^ h) * 0x45d9f3b;
+        h = (h >> 16) ^ h;
+        return static_cast<float>(h & 0xFFFF) / 65535.0f;
+    };
+
+    for (int i = 0; i < numRays; ++i) {
+        // Random direction on sphere surface
+        float u = pseudoRand(i * 3 + 0) * 2.0f - 1.0f;
+        float v = pseudoRand(i * 3 + 1) * 2.0f * 3.14159265f;
+        float s = std::sqrt(1.0f - u * u);
+        Vec3 dir = {s * std::cos(v), u, s * std::sin(v)};
+        dir = dir.normalized();
+
+        // Origin far away from sphere, pointing toward center
+        Vec3 orig = dir * (-6.0f);  // 6 units away from center
+        Vec3 rayDir = dir;          // pointing inward
+
+        float tOrig = raycastMesh(orig, rayDir, sphere.vertices, sphere.indices);
+        float tSimp = raycastMesh(orig, rayDir, simplified.vertices, simplified.indices);
+
+        if (tOrig > 0) hitsOrig++;
+        if (tSimp > 0) hitsSimp++;
+        if (tOrig > 0 && tSimp > 0) {
+            hitsBoth++;
+            float err = tOrig - tSimp;
+            sumSqError += err * err;
+        }
+    }
+
+    // Both meshes should be hit by most rays
+    ASSERT_GT(hitsOrig, numRays / 2);
+    ASSERT_GT(hitsSimp, numRays / 2);
+    ASSERT_GT(hitsBoth, numRays / 4);
+
+    // RMS error should be below threshold (related to voxel size)
+    float rmsError = std::sqrt(sumSqError / std::max(hitsBoth, 1));
+    // Error should be within a few voxel sizes
+    float errorThreshold = vs * 4.0f;
+    ASSERT_LT(rmsError, errorThreshold);
+}
+
+// ============================================================================
+// 6. Thread Safety / Async Tests
 // ============================================================================
 
 TEST(async_build_completes) {

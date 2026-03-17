@@ -19,6 +19,84 @@
 static const char* kMeshFiles[] = {"meshes/nav_test.obj", "meshes/dungeon.obj", "meshes/undulating.obj"};
 static const int kNumMeshes = 3;
 
+// Gravity direction presets
+static const char* kGravityDirNames[] = {"Y-down", "Y-up", "X+", "X-", "Z+", "Z-"};
+static const voxnav::Vec3 kGravityDirs[] = {
+    {0, -1, 0}, {0, 1, 0}, {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}
+};
+
+// Gravity zone colors
+static void getGravityZoneColor(const voxnav::Vec3& grav, float& r, float& g, float& b) {
+    float ax = std::abs(grav.x), ay = std::abs(grav.y), az = std::abs(grav.z);
+    if (ay >= ax && ay >= az) {
+        if (grav.y < 0) { r = 0.2f; g = 0.9f; b = 0.3f; }       // Y-down: green
+        else             { r = 0.9f; g = 0.2f; b = 0.9f; }       // Y-up: magenta
+    } else if (ax >= az) {
+        r = 0.2f; g = 0.3f; b = 0.9f;                            // X+/X-: blue
+    } else {
+        r = 0.9f; g = 0.6f; b = 0.2f;                            // Z+/Z-: orange
+    }
+}
+
+// Build a wireframe box (12 edges = 24 line vertices)
+static void buildWireframeBox(const voxnav::AABB& box, GLMeshBuffer& buf) {
+    voxnav::Vec3 mn = box.min, mx = box.max;
+    // 8 corners
+    voxnav::Vec3 c[8] = {
+        {mn.x, mn.y, mn.z}, {mx.x, mn.y, mn.z}, {mx.x, mx.y, mn.z}, {mn.x, mx.y, mn.z},
+        {mn.x, mn.y, mx.z}, {mx.x, mn.y, mx.z}, {mx.x, mx.y, mx.z}, {mn.x, mx.y, mx.z}
+    };
+    // 12 edges as pairs of corner indices
+    static const int edges[12][2] = {
+        {0,1},{1,2},{2,3},{3,0}, {4,5},{5,6},{6,7},{7,4},
+        {0,4},{1,5},{2,6},{3,7}
+    };
+    std::vector<float> verts;
+    std::vector<uint32_t> idx;
+    for (auto& e : edges) {
+        uint32_t base = static_cast<uint32_t>(verts.size() / 6);
+        for (int vi = 0; vi < 2; ++vi) {
+            verts.push_back(c[e[vi]].x); verts.push_back(c[e[vi]].y); verts.push_back(c[e[vi]].z);
+            verts.push_back(0); verts.push_back(1); verts.push_back(0); // dummy normal
+        }
+        idx.push_back(base); idx.push_back(base + 1);
+    }
+    buf.upload(verts, idx);
+}
+
+// Build voxel debug point cloud (solid voxels as GL_POINTS)
+static void buildVoxelPointCloud(const voxnav::VoxelGrid& grid, GLMeshBuffer& buf) {
+    std::vector<float> verts;
+    std::vector<uint32_t> idx;
+    uint32_t count = 0;
+    for (int z = 0; z < grid.nz; ++z) {
+        for (int y = 0; y < grid.ny; ++y) {
+            for (int x = 0; x < grid.nx; ++x) {
+                if (!grid.get(x, y, z)) continue;
+                // Check if surface voxel (has at least one empty neighbor)
+                bool surface = false;
+                for (int d = 0; d < 6 && !surface; ++d) {
+                    int nx = x + (d == 0 ? 1 : d == 1 ? -1 : 0);
+                    int ny = y + (d == 2 ? 1 : d == 3 ? -1 : 0);
+                    int nz = z + (d == 4 ? 1 : d == 5 ? -1 : 0);
+                    if (nx < 0 || nx >= grid.nx || ny < 0 || ny >= grid.ny || nz < 0 || nz >= grid.nz)
+                        surface = true;
+                    else if (!grid.get(nx, ny, nz))
+                        surface = true;
+                }
+                if (!surface) continue;
+                float px = grid.bounds.min.x + (x + 0.5f) * grid.voxelSize;
+                float py = grid.bounds.min.y + (y + 0.5f) * grid.voxelSize;
+                float pz = grid.bounds.min.z + (z + 0.5f) * grid.voxelSize;
+                verts.push_back(px); verts.push_back(py); verts.push_back(pz);
+                verts.push_back(0); verts.push_back(1); verts.push_back(0); // dummy normal
+                idx.push_back(count++);
+            }
+        }
+    }
+    buf.upload(verts, idx);
+}
+
 int main(int, char**) {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
@@ -57,8 +135,14 @@ int main(int, char**) {
     bool buildPending = false;
     float buildTimeMs = 0;
 
-    GLMeshBuffer origBuf, simplifiedBuf, walkableBuf, pathBuf;
+    GLMeshBuffer origBuf, simplifiedBuf, pathBuf, voxelBuf;
+    // Per-gravity-zone walkable face buffers
+    GLMeshBuffer walkBufGreen, walkBufMagenta, walkBufBlue, walkBufOrange;
+    // Gravity box wireframe buffers
+    std::vector<GLMeshBuffer> gravBoxBufs;
+
     bool showOrig = true, showSimplified = true, showWalkable = true, showPath = true;
+    bool showVoxels = false;
 
     float voxelSize = 0.25f;
     float agentRadius = 0.5f;
@@ -72,6 +156,11 @@ int main(int, char**) {
 
     // Gravity boxes
     std::vector<voxnav::GravityBox> gravityBoxes;
+
+    // New gravity box input fields
+    float newBoxMin[3] = {-1, -1, -1};
+    float newBoxMax[3] = {1, 1, 1};
+    int newGravDirIdx = 0;
 
     // Load initial mesh
     auto loadMesh = [&](int idx) {
@@ -98,25 +187,52 @@ int main(int, char**) {
         hasBuildResult = false;
     };
 
+    auto rebuildGravBoxBufs = [&]() {
+        for (auto& b : gravBoxBufs) b.destroy();
+        gravBoxBufs.resize(gravityBoxes.size());
+        for (size_t i = 0; i < gravityBoxes.size(); ++i) {
+            buildWireframeBox(gravityBoxes[i].box, gravBoxBufs[i]);
+        }
+    };
+
     auto rebuildBuffers = [&]() {
         Renderer::buildBuffer(sourceMesh, origBuf);
         Renderer::buildBuffer(buildResult.simplifiedMesh, simplifiedBuf);
 
-        // Build walkable faces buffer
+        // Build per-gravity-zone walkable face buffers (Issue 3)
         auto& wf = buildResult.navMesh.getWalkableFaces();
         auto& sm = buildResult.navMesh.getMesh();
-        voxnav::SimplifiedMesh walkMesh;
+
+        voxnav::SimplifiedMesh meshGreen, meshMagenta, meshBlue, meshOrange;
         for (int fi : wf) {
             auto tri = sm.getTriangle(fi);
-            uint32_t base = static_cast<uint32_t>(walkMesh.vertices.size());
-            walkMesh.vertices.push_back(tri.v0);
-            walkMesh.vertices.push_back(tri.v1);
-            walkMesh.vertices.push_back(tri.v2);
-            walkMesh.indices.push_back(base);
-            walkMesh.indices.push_back(base + 1);
-            walkMesh.indices.push_back(base + 2);
+            voxnav::Vec3 grav = buildResult.navMesh.getGravityForFace(fi);
+            float cr, cg, cb;
+            getGravityZoneColor(grav, cr, cg, cb);
+
+            voxnav::SimplifiedMesh* target;
+            if (cr > 0.5f && cg < 0.5f && cb > 0.5f) target = &meshMagenta;
+            else if (cr < 0.5f && cg < 0.5f && cb > 0.5f) target = &meshBlue;
+            else if (cr > 0.5f && cg > 0.5f && cb < 0.5f) target = &meshOrange;
+            else target = &meshGreen;
+
+            uint32_t base = static_cast<uint32_t>(target->vertices.size());
+            target->vertices.push_back(tri.v0);
+            target->vertices.push_back(tri.v1);
+            target->vertices.push_back(tri.v2);
+            target->indices.push_back(base);
+            target->indices.push_back(base + 1);
+            target->indices.push_back(base + 2);
         }
-        Renderer::buildBuffer(walkMesh, walkableBuf);
+        Renderer::buildBuffer(meshGreen, walkBufGreen);
+        Renderer::buildBuffer(meshMagenta, walkBufMagenta);
+        Renderer::buildBuffer(meshBlue, walkBufBlue);
+        Renderer::buildBuffer(meshOrange, walkBufOrange);
+
+        // Build voxel debug visualization (Issue 4)
+        buildVoxelPointCloud(buildResult.dilatedGrid, voxelBuf);
+
+        rebuildGravBoxBufs();
     };
 
     doRebuild();
@@ -129,19 +245,25 @@ int main(int, char**) {
         while (SDL_PollEvent(&ev)) {
             ImGui_ImplSDL2_ProcessEvent(&ev);
             if (ev.type == SDL_QUIT) running = false;
-            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_TAB)
+            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_TAB) {
                 camera.fps = !camera.fps;
+                // Issue 2: Toggle mouse capture for FPS mode
+                SDL_SetRelativeMouseMode(camera.fps ? SDL_TRUE : SDL_FALSE);
+            }
             if (!ImGui::GetIO().WantCaptureMouse) {
                 if (ev.type == SDL_MOUSEWHEEL) camera.zoom(static_cast<float>(ev.wheel.y));
                 if (ev.type == SDL_MOUSEMOTION) {
-                    if (ev.motion.state & SDL_BUTTON_RMASK)
-                        camera.orbit(static_cast<float>(ev.motion.xrel), static_cast<float>(ev.motion.yrel));
-                    if (ev.motion.state & SDL_BUTTON_MMASK)
-                        camera.pan(static_cast<float>(ev.motion.xrel), static_cast<float>(ev.motion.yrel));
+                    // Issue 2: FPS mouse look when captured
+                    if (camera.fps) {
+                        camera.fpsLook(static_cast<float>(ev.motion.xrel),
+                                       static_cast<float>(ev.motion.yrel));
+                    } else {
+                        if (ev.motion.state & SDL_BUTTON_RMASK)
+                            camera.orbit(static_cast<float>(ev.motion.xrel), static_cast<float>(ev.motion.yrel));
+                        if (ev.motion.state & SDL_BUTTON_MMASK)
+                            camera.pan(static_cast<float>(ev.motion.xrel), static_cast<float>(ev.motion.yrel));
+                    }
                 }
-            }
-            if (!ImGui::GetIO().WantCaptureKeyboard && camera.fps) {
-                // FPS handled below
             }
         }
 
@@ -194,19 +316,37 @@ int main(int, char**) {
         ImGui::Checkbox("Simplified Mesh", &showSimplified);
         ImGui::Checkbox("Walkable Faces", &showWalkable);
         ImGui::Checkbox("Path", &showPath);
+        ImGui::Checkbox("Show Voxels", &showVoxels);
         ImGui::End();
 
+        // Issue 1: Gravity Box editor with add functionality
         ImGui::Begin("Gravity Boxes");
         for (size_t i = 0; i < gravityBoxes.size(); ++i) {
             ImGui::PushID(static_cast<int>(i));
-            ImGui::Text("Box %zu: grav=(%.1f,%.1f,%.1f)", i,
-                gravityBoxes[i].gravityDir.x, gravityBoxes[i].gravityDir.y, gravityBoxes[i].gravityDir.z);
+            auto& gb = gravityBoxes[i];
+            ImGui::Text("Box %zu: (%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f) grav=(%.1f,%.1f,%.1f)",
+                i, gb.box.min.x, gb.box.min.y, gb.box.min.z,
+                gb.box.max.x, gb.box.max.y, gb.box.max.z,
+                gb.gravityDir.x, gb.gravityDir.y, gb.gravityDir.z);
             ImGui::SameLine();
             if (ImGui::Button("Delete")) {
                 gravityBoxes.erase(gravityBoxes.begin() + i);
                 --i;
             }
             ImGui::PopID();
+        }
+        ImGui::Separator();
+        ImGui::Text("Add New Gravity Box:");
+        ImGui::InputFloat3("Min Corner", newBoxMin);
+        ImGui::InputFloat3("Max Corner", newBoxMax);
+        ImGui::Combo("Gravity Dir", &newGravDirIdx, "Y-down\0Y-up\0X+\0X-\0Z+\0Z-\0");
+        if (ImGui::Button("Add Gravity Box")) {
+            voxnav::GravityBox gb;
+            gb.box.min = {newBoxMin[0], newBoxMin[1], newBoxMin[2]};
+            gb.box.max = {newBoxMax[0], newBoxMax[1], newBoxMax[2]};
+            gb.gravityDir = kGravityDirs[newGravDirIdx];
+            gravityBoxes.push_back(gb);
+            rebuildGravBoxBufs();
         }
         ImGui::End();
 
@@ -261,9 +401,41 @@ int main(int, char**) {
             simplifiedBuf.draw();
         }
 
+        // Issue 3: Draw walkable faces colored by gravity zone
         if (showWalkable && hasBuildResult) {
             renderer.setColor(0.2f, 0.9f, 0.3f, 0.7f);
-            walkableBuf.draw();
+            walkBufGreen.draw();
+            renderer.setColor(0.9f, 0.2f, 0.9f, 0.7f);
+            walkBufMagenta.draw();
+            renderer.setColor(0.2f, 0.3f, 0.9f, 0.7f);
+            walkBufBlue.draw();
+            renderer.setColor(0.9f, 0.6f, 0.2f, 0.7f);
+            walkBufOrange.draw();
+        }
+
+        // Issue 4: Voxel debug visualization
+        if (showVoxels && hasBuildResult) {
+            renderer.setColor(1.0f, 0.4f, 0.1f, 0.6f);
+            glEnable(GL_PROGRAM_POINT_SIZE);
+            glPointSize(3.0f);
+            if (voxelBuf.vao) {
+                glBindVertexArray(voxelBuf.vao);
+                glDrawElements(GL_POINTS, voxelBuf.indexCount, GL_UNSIGNED_INT, nullptr);
+                glBindVertexArray(0);
+            }
+        }
+
+        // Issue 1: Render gravity box wireframes
+        for (size_t i = 0; i < gravBoxBufs.size(); ++i) {
+            float cr, cg, cb;
+            getGravityZoneColor(gravityBoxes[i].gravityDir, cr, cg, cb);
+            renderer.setColor(cr, cg, cb, 1.0f);
+            glLineWidth(2.0f);
+            if (gravBoxBufs[i].vao) {
+                glBindVertexArray(gravBoxBufs[i].vao);
+                glDrawElements(GL_LINES, gravBoxBufs[i].indexCount, GL_UNSIGNED_INT, nullptr);
+                glBindVertexArray(0);
+            }
         }
 
         if (showPath && hasPath) {
@@ -283,8 +455,13 @@ int main(int, char**) {
 
     origBuf.destroy();
     simplifiedBuf.destroy();
-    walkableBuf.destroy();
+    walkBufGreen.destroy();
+    walkBufMagenta.destroy();
+    walkBufBlue.destroy();
+    walkBufOrange.destroy();
     pathBuf.destroy();
+    voxelBuf.destroy();
+    for (auto& b : gravBoxBufs) b.destroy();
     renderer.destroy();
 
     ImGui_ImplOpenGL3_Shutdown();
